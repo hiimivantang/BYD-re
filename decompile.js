@@ -6,13 +6,19 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const bangcle = require('./bangcle');
+const wbsk = require('./wbsk');
 
 const DEFAULT_ALGORITHM = 'aes-128-cbc';
 const ZERO_IV = Buffer.alloc(16, 0);
 
 const CONFIG_KEY = Buffer.from('796834E7A2839412D79DBC5F1327594D', 'hex');
+// CN app pre-login content key: md5 of the default encryptToken from JniUtil#getCommonParams.
+const CN_GUEST_KEY = crypto.createHash('md5')
+  .update('hOPFS9FRayGa5CI7A0jL3edvzXdrzt9jqhjGe7dcQSNU9yfZAbIyLZyYAJEqLlK8')
+  .digest();
 const KNOWN_KEYS = Object.freeze([
   { name: 'CONFIG_KEY', key: CONFIG_KEY },
+  { name: 'CN_GUEST_KEY', key: CN_GUEST_KEY },
 ]);
 const HEX_RE = /^[0-9a-fA-F]+$/;
 const KEY_HEX_RE = /^[0-9A-F]{32}$/;
@@ -38,6 +44,18 @@ function looksLikeBangcleEnvelope(text) {
   }
   const cleaned = text.replace(/\s+/g, '').trim();
   return ENVELOPE_RE.test(cleaned);
+}
+
+// Derive the CN app bootstrap key from a password: md5(MD5(password).toUpperCase()).
+// This key decrypts the login respondData; after that, the content key is learned
+// from token.encryptToken automatically via captureStateFromDecodedField.
+function derivePasswordBootstrapKey(password) {
+  if (!password) {
+    return null;
+  }
+  const inner = crypto.createHash('md5').update(password, 'utf8').digest('hex').toUpperCase();
+  const keyHex = crypto.createHash('md5').update(inner, 'utf8').digest('hex').toUpperCase();
+  return { keyHex, source: 'md5(MD5(password).upper())' };
 }
 
 function tryParseJson(text) {
@@ -363,13 +381,17 @@ function captureStateFromDecodedField(state, outerObject, field, decodedResult, 
     return false;
   }
   const token = parsed.token && typeof parsed.token === 'object' ? parsed.token : null;
-  if (!token || typeof token.encryToken !== 'string') {
+  const tokenStr = token
+    && (typeof token.encryToken === 'string' ? token.encryToken
+      : typeof token.encryptToken === 'string' ? token.encryptToken
+      : null);
+  if (!tokenStr) {
     return false;
   }
   const userId = (typeof token.userId === 'string' || typeof token.userId === 'number')
     ? String(token.userId)
     : (typeof outerObject.identifier === 'string' ? outerObject.identifier : null);
-  const contentKey = crypto.createHash('md5').update(token.encryToken, 'utf8').digest('hex').toUpperCase();
+  const contentKey = crypto.createHash('md5').update(tokenStr, 'utf8').digest('hex').toUpperCase();
   const added = addStateKey(state, contentKey, userId, 'token.encryToken');
   if (debug && added) {
     console.error(`# state: learned content key for identifier=${userId || 'unknown'}`);
@@ -571,8 +593,20 @@ if (require.main === module) {
           console.error(`Bangcle decode failed: ${err.message}`);
         }
       }
-    } else {
+    } else if (compactInput.startsWith('{') || compactInput.startsWith('[')) {
+      // Already JSON — pass through directly.
       setOuter(decodeInput);
+    } else {
+      // Try offline WBC decryption for CN app WBSK envelopes.
+      try {
+        const plaintext = wbsk.decryptEnvelope(compactInput);
+        setOuter(plaintext);
+      } catch (err) {
+        if (debug) {
+          console.error(`WBSK decrypt failed: ${err.message}`);
+        }
+        setOuter(decodeInput);
+      }
     }
 
     if (outerText) {
@@ -587,6 +621,10 @@ if (require.main === module) {
       if (addStateKey(state, entry.keyHex, entry.identifier, entry.source)) {
         stateDirty = true;
       }
+    }
+    const pwKey = derivePasswordBootstrapKey(process.env.BYD_PASSWORD);
+    if (pwKey) {
+      addStateKey(state, pwKey.keyHex, null, pwKey.source);
     }
 
     const effectiveIdentifier = typeof outerObject.identifier === 'string' ? outerObject.identifier : null;

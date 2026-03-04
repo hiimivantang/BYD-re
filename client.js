@@ -7,6 +7,7 @@ const readline = require('readline');
 const util = require('util');
 const { loadEnvFile } = require('node:process');
 const bangcle = require('./bangcle');
+const wbsk = require('./wbsk');
 
 try {
   loadEnvFile();
@@ -16,7 +17,8 @@ try {
   }
 }
 
-const BASE_URL = 'https://dilinkappoversea-eu.byd.auto';
+const BASE_URL = process.env.BYD_BASE_URL || 'https://dilinkappoversea-eu.byd.auto';
+const CN_MODE = /cn\.byd\.auto/i.test(BASE_URL);
 const USER_AGENT = 'okhttp/4.12.0';
 
 // Username/password are expected from environment or .env. Optional BYD_* overrides can also be placed in .env.
@@ -46,6 +48,13 @@ const CONFIG = Object.freeze({
   model: process.env.BYD_MODEL || 'POCO F1',
   sdk: process.env.BYD_SDK || '35',
   mod: process.env.BYD_MOD || 'Xiaomi',
+  // CN-specific fields
+  appChannel: process.env.BYD_APP_CHANNEL || '99',
+  cnAppInnerVersion: process.env.BYD_CN_APP_INNER_VERSION || '502',
+  cnAppVersion: process.env.BYD_CN_APP_VERSION || '9.10.2',
+  targetBrand: process.env.BYD_TARGET_BRAND || '1',
+  vehicleBrand: process.env.BYD_VEHICLE_BRAND || '1',
+  networkOperator: process.env.BYD_NETWORK_OPERATOR || '\u65e0',
   realtimePollAttempts: 10,
   realtimePollIntervalMs: 1500,
 });
@@ -90,6 +99,27 @@ function computeCheckcode(payload) {
   const json = JSON.stringify(payload);
   const md5 = crypto.createHash('md5').update(json, 'utf8').digest('hex');
   return `${md5.slice(24, 32)}${md5.slice(8, 16)}${md5.slice(16, 24)}${md5.slice(0, 8)}`;
+}
+
+function computeCnCheckcode(jsonStr) {
+  return crypto.createHash('sha256').update(jsonStr, 'utf8').digest('hex');
+}
+
+function addCnDeviceFields(payload) {
+  payload.ostype = CONFIG.ostype;
+  payload.imei = CONFIG.imei;
+  payload.mac = CONFIG.mac;
+  payload.model = CONFIG.model;
+  payload.sdk = CONFIG.sdk;
+  payload.serviceTime = String(Date.now());
+  payload.mod = CONFIG.mod;
+  payload.checkcode = computeCnCheckcode(JSON.stringify(payload));
+  return payload;
+}
+
+function encodeCnOuterPayload(payload) {
+  addCnDeviceFields(payload);
+  return wbsk.encryptEnvelope(JSON.stringify(payload));
 }
 
 function aesEncryptHex(plaintextUtf8, keyHex) {
@@ -137,12 +167,19 @@ function stepLog(message, details) {
 }
 
 function encodeOuterPayload(payload) {
+  if (CN_MODE) {
+    return encodeCnOuterPayload(payload);
+  }
   return bangcle.encodeEnvelope(JSON.stringify(payload));
 }
 
 function decodeOuterPayload(rawPayload) {
   if (typeof rawPayload !== 'string' || !rawPayload.trim()) {
     throw new Error('Empty response payload');
+  }
+  if (CN_MODE) {
+    const plaintext = wbsk.decryptEnvelope(rawPayload.trim());
+    return JSON.parse(plaintext);
   }
   const decodedText = bangcle.decodeEnvelope(rawPayload).toString('utf8').trim();
   const normalised = (decodedText.startsWith('F{') || decodedText.startsWith('F['))
@@ -197,6 +234,12 @@ async function postSecure(endpoint, outerPayload) {
     'content-type': 'application/json; charset=UTF-8',
     'user-agent': USER_AGENT,
   };
+
+  if (CN_MODE) {
+    headers.version = CONFIG.cnAppInnerVersion;
+    headers.platform = 'ANDROID';
+    headers.BrandFlag = 'dynasty';
+  }
 
   const cookie = buildCookieHeader();
   if (cookie) {
@@ -290,11 +333,107 @@ function buildLoginRequest(nowMs) {
   return { outer };
 }
 
+function buildCnLoginRequest(nowMs) {
+  const random = randomHex16();
+  const reqTimestamp = String(nowMs);
+  const loginKey = pwdLoginKey(CONFIG.password);
+
+  // Inner payload: device info, encrypted as encryData
+  const inner = {
+    appInnerVersion: CONFIG.cnAppInnerVersion,
+    appVersion: CONFIG.cnAppVersion,
+    bluetoothMac: '',
+    city: '',
+    configVersion: '10000',
+    deviceType: CONFIG.deviceType,
+    devicename: `${CONFIG.mobileBrand}${CONFIG.mobileModel}`,
+    imeiMD5: CONFIG.imeiMd5,
+    isAuto: '0',
+    latitude: '',
+    longitude: '',
+    mobileBrand: CONFIG.mobileBrand,
+    mobileModel: CONFIG.mobileModel,
+    networkOperator: CONFIG.networkOperator,
+    networkType: CONFIG.networkType,
+    osType: 'Android',
+    osVersion: CONFIG.osType,
+    random,
+    softType: CONFIG.softType,
+    timeStamp: reqTimestamp,
+  };
+
+  const encryData = aesEncryptHex(JSON.stringify(inner), loginKey);
+
+  // Sign from inner fields + outer context fields
+  const signFields = {
+    ...inner,
+    appChannel: CONFIG.appChannel,
+    identifier: CONFIG.username,
+    loginType: 0,
+    reqTimestamp,
+    targetBrand: CONFIG.targetBrand,
+  };
+
+  const sign = sha1Mixed(buildSignString(signFields, md5Hex(CONFIG.password)));
+
+  const outer = {
+    appChannel: CONFIG.appChannel,
+    encryData,
+    identifier: CONFIG.username,
+    imeiMD5: CONFIG.imeiMd5,
+    isAuto: '0',
+    loginType: 0,
+    reqTimestamp,
+    sign,
+    targetBrand: CONFIG.targetBrand,
+  };
+
+  return { outer };
+}
+
 function buildTokenOuterEnvelope(nowMs, session, inner) {
   const reqTimestamp = String(nowMs);
   const contentKey = md5Hex(session.encryToken);
   const signKey = md5Hex(session.signToken);
+
+  if (CN_MODE) {
+    const encryData = aesEncryptHex(JSON.stringify(inner), contentKey);
+    const idType = inner.vin ? 0 : 2;
+    const signFields = {
+      ...inner,
+      appChannel: CONFIG.appChannel,
+      identifier: session.superId || session.userId,
+      identifierType: idType,
+      imeiMD5: CONFIG.imeiMd5,
+      reqTimestamp,
+      targetBrand: CONFIG.targetBrand,
+      vehicleBrand: CONFIG.vehicleBrand,
+    };
+    if (inner.vin) {
+      signFields.objective = inner.vin;
+    }
+    const sign = sha1Mixed(buildSignString(signFields, signKey));
+    const outer = {
+      appChannel: CONFIG.appChannel,
+      encryData,
+      identifier: session.superId || session.userId,
+      identifierType: idType,
+      imeiMD5: CONFIG.imeiMd5,
+      objective: inner.vin || null,
+      outModelTypes: null,
+      reqTimestamp,
+      sign,
+      softType: null,
+      targetBrand: CONFIG.targetBrand,
+      vehicleBrand: CONFIG.vehicleBrand,
+      version: null,
+    };
+    addCnDeviceFields(outer);
+    return { outer, contentKey };
+  }
+
   const encryData = aesEncryptHex(JSON.stringify(inner), contentKey);
+
   const signFields = {
     ...inner,
     countryCode: CONFIG.countryCode,
@@ -320,14 +459,7 @@ function buildTokenOuterEnvelope(nowMs, session, inner) {
 }
 
 function buildListRequest(nowMs, session) {
-  const inner = {
-    deviceType: CONFIG.deviceType,
-    imeiMD5: CONFIG.imeiMd5,
-    networkType: CONFIG.networkType,
-    random: randomHex16(),
-    timeStamp: String(nowMs),
-    version: CONFIG.appInnerVersion,
-  };
+  const inner = CN_MODE ? { appUiName: '', ...buildInner(nowMs) } : buildInner(nowMs);
   return buildTokenOuterEnvelope(nowMs, session, inner);
 }
 
@@ -353,10 +485,19 @@ function buildEmqBrokerRequest(nowMs, session) {
     networkType: CONFIG.networkType,
     random: randomHex16(),
     timeStamp: String(nowMs),
-    version: CONFIG.appInnerVersion,
+    version: CN_MODE ? CONFIG.cnAppInnerVersion : CONFIG.appInnerVersion,
   };
   return buildTokenOuterEnvelope(nowMs, session, inner);
 }
+
+// Map brand IDs to CN broker field names
+const CN_BROKER_FIELDS = {
+  '1': 'dynastyEmqBroker',
+  '2': 'oceanEmqBroker',
+  '3': 'denzaEmqBroker',
+  '4': 'yangwangEmqBroker',
+  '5': 'fangchengbaoEmqBroker',
+};
 
 async function fetchEmqBroker(session) {
   const req = buildEmqBrokerRequest(Date.now(), session);
@@ -365,21 +506,42 @@ async function fetchEmqBroker(session) {
     throw new Error(`Broker lookup failed: code=${outer.code} message=${outer.message || ''}`.trim());
   }
   const decoded = decryptRespondDataJson(outer.respondData, req.contentKey);
-  const broker = decoded && (decoded.emqBorker || decoded.emqBroker)
-    ? String(decoded.emqBorker || decoded.emqBroker)
-    : '';
+  let broker;
+  if (CN_MODE) {
+    const brokerField = CN_BROKER_FIELDS[CONFIG.targetBrand] || 'dynastyEmqBroker';
+    broker = decoded && decoded[brokerField] ? String(decoded[brokerField]) : '';
+  } else {
+    broker = decoded && (decoded.emqBorker || decoded.emqBroker)
+      ? String(decoded.emqBorker || decoded.emqBroker) : '';
+  }
   if (!broker) {
-    throw new Error('Broker lookup response missing emqBorker');
+    throw new Error(`Broker lookup response missing broker (CN=${CN_MODE}, brand=${CONFIG.targetBrand})`);
   }
   return broker;
 }
 
+async function fetchVehicleList(session) {
+  const endpoint = CN_MODE ? '/app/auth/getAllListByUserId' : '/app/account/getAllListByUserId';
+  const req = buildListRequest(Date.now(), session);
+  const outer = await postSecure(endpoint, req.outer);
+  if (String(outer.code) !== '0') {
+    throw new Error(`Vehicle list failed: code=${outer.code} message=${outer.message || ''}`.trim());
+  }
+  const raw = decryptRespondDataJson(outer.respondData, req.contentKey);
+  const list = Array.isArray(raw) ? raw
+    : (raw && Array.isArray(raw.diLinkAutoInfoList)) ? raw.diLinkAutoInfoList
+    : [];
+  return list.filter(v => v && v.vin);
+}
+
 function buildMqttClientId() {
-  return `oversea_${String(CONFIG.imeiMd5).toUpperCase()}`;
+  const prefix = CN_MODE ? 'dynasty' : 'oversea';
+  return `${prefix}_${String(CONFIG.imeiMd5).toUpperCase()}`;
 }
 
 function buildMqttPassword(session, clientId, tsSeconds) {
-  const base = `${session.signToken}${clientId}${session.userId}${tsSeconds}`;
+  const uid = CN_MODE ? (session.superId || session.userId) : session.userId;
+  const base = `${session.signToken}${clientId}${uid}${tsSeconds}`;
   const hash = md5Hex(base);
   return `${tsSeconds}${hash}`;
 }
@@ -438,37 +600,43 @@ async function verifyControlPassword(session, vin, pin) {
   };
 }
 
-function buildVehicleRealtimeEnvelope(nowMs, session, vin, requestSerial = null) {
-  const inner = {
+function buildInner(nowMs) {
+  if (CN_MODE) {
+    return {
+      deviceName: `${CONFIG.mobileBrand}${CONFIG.mobileModel}`,
+      deviceType: CONFIG.deviceType,
+      imeiMD5: CONFIG.imeiMd5,
+      mobileBrand: CONFIG.mobileBrand,
+      mobileModel: CONFIG.mobileModel,
+      networkOperator: CONFIG.networkOperator,
+      networkType: CONFIG.networkType,
+      osType: 'Android',
+      osVersion: CONFIG.osVersion,
+      random: randomHex16(),
+      softType: CONFIG.softType,
+      timeStamp: String(nowMs),
+      version: CONFIG.cnAppInnerVersion,
+    };
+  }
+  return {
     deviceType: CONFIG.deviceType,
-    energyType: '0',
     imeiMD5: CONFIG.imeiMd5,
     networkType: CONFIG.networkType,
     random: randomHex16(),
-    tboxVersion: CONFIG.tboxVersion,
     timeStamp: String(nowMs),
     version: CONFIG.appInnerVersion,
-    vin,
   };
-  if (requestSerial) {
-    inner.requestSerial = requestSerial;
-  }
+}
+
+function buildVehicleRealtimeEnvelope(nowMs, session, vin, requestSerial = null) {
+  const inner = { ...buildInner(nowMs), energyType: '0', tboxVersion: CONFIG.tboxVersion, vin };
+  if (requestSerial) inner.requestSerial = requestSerial;
   return buildTokenOuterEnvelope(nowMs, session, inner);
 }
 
 function buildGpsInfoEnvelope(nowMs, session, vin, requestSerial = null) {
-  const inner = {
-    deviceType: CONFIG.deviceType,
-    imeiMD5: CONFIG.imeiMd5,
-    networkType: CONFIG.networkType,
-    random: randomHex16(),
-    timeStamp: String(nowMs),
-    version: CONFIG.appInnerVersion,
-    vin,
-  };
-  if (requestSerial) {
-    inner.requestSerial = requestSerial;
-  }
+  const inner = { ...buildInner(nowMs), vin };
+  if (requestSerial) inner.requestSerial = requestSerial;
   return buildTokenOuterEnvelope(nowMs, session, inner);
 }
 
@@ -608,6 +776,19 @@ async function pollGpsInfo(session, vin) {
   let latest = null;
   let serial = null;
   const pollTrace = [];
+
+  // CN GPS: single request, no polling loop
+  if (CN_MODE) {
+    const ep = '/vehicleInfo/gps/locationRequestService';
+    try {
+      const result = await fetchGpsEndpoint(ep, session, vin, null);
+      pollTrace.push({ stage: 'request', endpoint: ep });
+      stepLog('GPS poll', pollTrace[pollTrace.length - 1]);
+      return { ok: true, code: '0', message: 'SUCCESS', gpsInfo: result.gpsInfo, requestSerial: null, pollTrace };
+    } catch (err) {
+      return { ok: false, code: '', message: err.message, gpsInfo: null, requestSerial: null, pollTrace };
+    }
+  }
 
   try {
     const requestResult = await fetchGpsEndpoint('/control/getGpsInfo', session, vin, null);
@@ -1707,7 +1888,7 @@ function buildStatusHtml(output) {
       var gpsData = isObject(gpsInfo.data) ? gpsInfo.data : gpsInfo;
 
       var carImageUrl = firstString([
-        pick(primaryVehicle, ['picMainUrl', 'picSetUrl']),
+        pick(primaryVehicle, ['picMainUrl', 'picSetUrl', 'diFansVehicleImg']),
         pick(primaryVehicle.cfPic, ['picMainUrl', 'picSetUrl']),
         pick(vehicleInfo, ['picMainUrl', 'picSetUrl']),
         pick(vehicleInfo.cfPic, ['picMainUrl', 'picSetUrl']),
@@ -1969,6 +2150,40 @@ Options:
 `);
 }
 
+async function performLogin() {
+  const loginReq = CN_MODE ? buildCnLoginRequest(Date.now()) : buildLoginRequest(Date.now());
+  const endpoint = CN_MODE ? '/app/auth/login' : '/app/account/login';
+  const resp = await postSecure(endpoint, loginReq.outer);
+  if (String(resp.code) !== '0') {
+    throw new Error(`Login failed: code=${resp.code} message=${resp.message || ''}`.trim());
+  }
+
+  const loginKey = pwdLoginKey(CONFIG.password);
+  const loginInner = decryptRespondDataJson(resp.respondData, loginKey);
+  const token = loginInner && loginInner.token ? loginInner.token : {};
+
+  const signToken = String(token.signToken || '');
+  const encryToken = String(token.encryToken || token.encryptToken || '');
+
+  let userId, superId;
+  if (CN_MODE) {
+    // CN uses superId as the primary user ID, with brand-specific userIds in superBindRelationDtoMap
+    superId = String(token.superId || '');
+    const brandUserId = token.superBindRelationDtoMap
+      && token.superBindRelationDtoMap[CONFIG.targetBrand]
+      ? String(token.superBindRelationDtoMap[CONFIG.targetBrand].userId) : '';
+    userId = brandUserId || superId;
+  } else {
+    userId = String(token.userId || '');
+  }
+
+  if (!userId || !signToken || !encryToken) {
+    throw new Error('Login response missing token fields');
+  }
+  stepLog('Login succeeded', { userId, ...(superId ? { superId } : {}) });
+  return { userId, signToken, encryToken, ...(superId ? { superId } : {}) };
+}
+
 async function main() {
   const parsed = util.parseArgs({
     args: process.argv.slice(2),
@@ -1997,51 +2212,21 @@ async function main() {
 
   stepLog('Starting login flow', {
     user: CONFIG.username,
-    countryCode: CONFIG.countryCode,
-    language: CONFIG.language,
+    mode: CN_MODE ? 'CN' : 'overseas',
+    baseUrl: BASE_URL,
   });
 
-  const loginReq = buildLoginRequest(Date.now());
-  const loginOuter = await postSecure('/app/account/login', loginReq.outer);
-  if (String(loginOuter.code) !== '0') {
-    throw new Error(`Login failed: code=${loginOuter.code} message=${loginOuter.message || ''}`.trim());
-  }
-
-  const loginKey = pwdLoginKey(CONFIG.password);
-  const loginInner = decryptRespondDataJson(loginOuter.respondData, loginKey);
-  const token = loginInner && loginInner.token ? loginInner.token : null;
-  const userId = token && token.userId ? String(token.userId) : '';
-  const signToken = token && token.signToken ? String(token.signToken) : '';
-  const encryToken = token && token.encryToken ? String(token.encryToken) : '';
-
-  if (!userId || !signToken || !encryToken) {
-    throw new Error('Login response missing token fields');
-  }
-
-  stepLog('Login succeeded', {
-    userId,
-    hasSignToken: Boolean(signToken),
-    hasEncryToken: Boolean(encryToken),
-  });
-
-  const session = { userId, signToken, encryToken };
+  const session = await performLogin();
+  const { userId, signToken, encryToken } = session;
 
   if (verifyPin) {
     const pin = await promptForSixDigitPin();
 
     let resolvedVin = CONFIG.vin;
     if (!resolvedVin) {
-      const listReq = buildListRequest(Date.now(), session);
-      const listOuter = await postSecure('/app/account/getAllListByUserId', listReq.outer);
-      if (String(listOuter.code) !== '0') {
-        throw new Error(`Vehicle list failed: code=${listOuter.code} message=${listOuter.message || ''}`.trim());
-      }
-      const vehicles = decryptRespondDataJson(listOuter.respondData, listReq.contentKey);
-      resolvedVin = Array.isArray(vehicles) && vehicles.length && vehicles[0] && vehicles[0].vin
-        ? String(vehicles[0].vin)
-        : '';
+      const cars = await fetchVehicleList(session);
+      resolvedVin = cars.length ? String(cars[0].vin) : '';
     }
-
     if (!resolvedVin) {
       throw new Error('Could not resolve VIN (set BYD_VIN or ensure vehicle list contains vin)');
     }
@@ -2059,26 +2244,21 @@ async function main() {
   const broker = await fetchEmqBroker(session);
   stepLog('Resolved MQTT broker', { broker });
   const mqttClientId = buildMqttClientId();
+  const mqttUserId = CN_MODE ? (session.superId || userId) : userId;
   const mqttPassword = buildMqttPassword(session, mqttClientId, Math.floor(Date.now() / 1000));
-  const mqttUrl = `mqtts://${userId}:${mqttPassword}@${broker}/oversea/res/${userId}`;
+  const mqttTopicPrefix = CN_MODE ? 'dynasty/res' : 'oversea/res';
+  const mqttUrl = `mqtts://${mqttUserId}:${mqttPassword}@${broker}/${mqttTopicPrefix}/${mqttUserId}`;
   console.log(`MQTT client: mosquitto_sub -V mqttv5 -L '${mqttUrl}' -i '${mqttClientId}' -d`);
   const mqttDecodeKeyHex = md5Hex(encryToken);
   const mqttDecodeCmd = `mosquitto_sub -V mqttv5 -L '${mqttUrl}' -i '${mqttClientId}' -F '%p' | node ./mqtt_decode.js '${mqttDecodeKeyHex}'`;
   console.log(`MQTT decode: ${mqttDecodeCmd}`);
 
-  const listReq = buildListRequest(Date.now(), session);
-  const listOuter = await postSecure('/app/account/getAllListByUserId', listReq.outer);
-  if (String(listOuter.code) !== '0') {
-    throw new Error(`Vehicle list failed: code=${listOuter.code} message=${listOuter.message || ''}`.trim());
-  }
-
-  const vehicles = decryptRespondDataJson(listOuter.respondData, listReq.contentKey);
+  const carsWithVin = await fetchVehicleList(session);
   stepLog('Vehicle list succeeded', {
-    vehicleCount: Array.isArray(vehicles) ? vehicles.length : 0,
-    vehicles,
+    count: carsWithVin.length,
+    selectedVin: carsWithVin.length > 0 ? carsWithVin[0].vin : null,
   });
-  const resolvedVin = CONFIG.vin
-    || (Array.isArray(vehicles) && vehicles.length && vehicles[0] && vehicles[0].vin ? String(vehicles[0].vin) : '');
+  const resolvedVin = CONFIG.vin || (carsWithVin.length ? String(carsWithVin[0].vin) : '');
   if (!resolvedVin) {
     throw new Error('Could not resolve VIN (set BYD_VIN or ensure vehicle list contains vin)');
   }
@@ -2117,7 +2297,7 @@ async function main() {
       signToken,
       encryToken,
     },
-    vehicles,
+    vehicles: carsWithVin,
     realtimePoll: realtime.pollTrace,
     vehicleInfo,
     gps: gpsResult,

@@ -10,6 +10,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+[[ -f "${ROOT_DIR}/.env" ]] && set -a && source "${ROOT_DIR}/.env" && set +a
 LOG_PATH="${1:-${SCRIPT_DIR}/samples/raw_hooks.log}"
 STATE_FILE="${TMPDIR:-/tmp}/byd-http-dec-state-$$.json"
 
@@ -41,11 +42,12 @@ extract_http_calls() {
 
 decode_payload() {
   local payload="$1"
-  if [[ -z "${payload// }" ]]; then
+  if [[ -z "$payload" ]]; then
     echo "(empty)"
     return
   fi
-  BYD_DECODE_STATE_FILE="$STATE_FILE" node "${ROOT_DIR}/decompile.js" http-dec "$payload"
+  BYD_DECODE_STATE_FILE="$STATE_FILE" \
+    node "${ROOT_DIR}/decompile.js" http-dec "$payload"
 }
 
 found=0
