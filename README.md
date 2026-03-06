@@ -10,7 +10,6 @@ Base hosts:
 
 - [`pyBYD`](https://github.com/jkaberg/pyBYD): full Python library built from these reverse-engineering findings.
 - [`hass-byd-vehicle`](https://github.com/jkaberg/hass-byd-vehicle): Home Assistant integration for BYD vehicles.
-- [`BYD-re custom_components`](https://github.com/codyc1515/BYD-re/tree/main/custom_components/byd): Home Assistant custom component for BYD.
 
 ## 🚀 Quickstart
 
