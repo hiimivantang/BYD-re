@@ -56,7 +56,7 @@ const CONFIG = Object.freeze({
   vehicleBrand: process.env.BYD_VEHICLE_BRAND || '1',
   networkOperator: process.env.BYD_NETWORK_OPERATOR || '\u65e0',
   realtimePollAttempts: 10,
-  realtimePollIntervalMs: 1500,
+  realtimePollIntervalMs: 250,
 });
 
 const cookieJar = new Map();
@@ -158,6 +158,18 @@ function commonOuterFields() {
   };
 }
 
+const TIMERS = {};
+function timerStart(label) {
+  TIMERS[label] = process.hrtime.bigint();
+}
+function timerEnd(label) {
+  const start = TIMERS[label];
+  if (!start) return 0;
+  const elapsed = Number(process.hrtime.bigint() - start) / 1e6;
+  delete TIMERS[label];
+  return elapsed;
+}
+
 function stepLog(message, details) {
   if (details && typeof details === 'object') {
     console.error(`[client] ${message} ${JSON.stringify(details)}`);
@@ -229,6 +241,8 @@ function buildCookieHeader() {
 }
 
 async function postSecure(endpoint, outerPayload) {
+  const t0 = process.hrtime.bigint();
+
   const headers = {
     'accept-encoding': 'identity',
     'content-type': 'application/json; charset=UTF-8',
@@ -247,6 +261,7 @@ async function postSecure(endpoint, outerPayload) {
   }
 
   const requestPayload = encodeOuterPayload(outerPayload);
+  const tEncode = process.hrtime.bigint();
 
   const response = await fetch(`${BASE_URL}${endpoint}`, {
     method: 'POST',
@@ -255,6 +270,7 @@ async function postSecure(endpoint, outerPayload) {
   });
 
   updateCookiesFromHeaders(response.headers);
+  const tFetch = process.hrtime.bigint();
 
   const bodyText = await response.text();
   if (!response.ok) {
@@ -273,6 +289,19 @@ async function postSecure(endpoint, outerPayload) {
   }
 
   const decoded = decodeOuterPayload(body.response);
+  const tDone = process.hrtime.bigint();
+
+  const encodeMs = Number(tEncode - t0) / 1e6;
+  const fetchMs = Number(tFetch - tEncode) / 1e6;
+  const decodeMs = Number(tDone - tFetch) / 1e6;
+  const totalMs = Number(tDone - t0) / 1e6;
+  stepLog(`POST ${endpoint}`, {
+    encodeMs: +encodeMs.toFixed(1),
+    fetchMs: +fetchMs.toFixed(1),
+    decodeMs: +decodeMs.toFixed(1),
+    totalMs: +totalMs.toFixed(1),
+  });
+
   return decoded;
 }
 
@@ -2210,14 +2239,18 @@ async function main() {
     throw new Error('Set BYD_USERNAME and BYD_PASSWORD');
   }
 
+  const tMain = process.hrtime.bigint();
+
   stepLog('Starting login flow', {
     user: CONFIG.username,
     mode: CN_MODE ? 'CN' : 'overseas',
     baseUrl: BASE_URL,
   });
 
+  timerStart('login');
   const session = await performLogin();
   const { userId, signToken, encryToken } = session;
+  stepLog(`Login completed in ${timerEnd('login').toFixed(0)}ms`);
 
   if (verifyPin) {
     const pin = await promptForSixDigitPin();
@@ -2241,7 +2274,14 @@ async function main() {
     return;
   }
 
-  const broker = await fetchEmqBroker(session);
+  // Fetch broker and vehicle list in parallel — they are independent
+  timerStart('broker+vehicles');
+  const [broker, carsWithVin] = await Promise.all([
+    fetchEmqBroker(session),
+    fetchVehicleList(session),
+  ]);
+  stepLog(`Broker + vehicle list completed in ${timerEnd('broker+vehicles').toFixed(0)}ms`);
+
   stepLog('Resolved MQTT broker', { broker });
   const mqttClientId = buildMqttClientId();
   const mqttUserId = CN_MODE ? (session.superId || userId) : userId;
@@ -2253,7 +2293,6 @@ async function main() {
   const mqttDecodeCmd = `mosquitto_sub -V mqttv5 -L '${mqttUrl}' -i '${mqttClientId}' -F '%p' | node ./mqtt_decode.js '${mqttDecodeKeyHex}'`;
   console.log(`MQTT decode: ${mqttDecodeCmd}`);
 
-  const carsWithVin = await fetchVehicleList(session);
   stepLog('Vehicle list succeeded', {
     count: carsWithVin.length,
     selectedVin: carsWithVin.length > 0 ? carsWithVin[0].vin : null,
@@ -2263,7 +2302,14 @@ async function main() {
     throw new Error('Could not resolve VIN (set BYD_VIN or ensure vehicle list contains vin)');
   }
 
-  const realtime = await pollVehicleRealtime(session, resolvedVin);
+  // Fetch realtime vehicle data and GPS in parallel — both only need session + VIN
+  timerStart('realtime+gps');
+  const [realtime, gpsResult] = await Promise.all([
+    pollVehicleRealtime(session, resolvedVin),
+    pollGpsInfo(session, resolvedVin),
+  ]);
+  stepLog(`Realtime + GPS completed in ${timerEnd('realtime+gps').toFixed(0)}ms`);
+
   const vehicleInfo = realtime.vehicleInfo;
   if (!vehicleInfo) {
     throw new Error('Vehicle realtime poll returned no data');
@@ -2275,7 +2321,6 @@ async function main() {
     requestSerial: realtime.requestSerial,
   });
 
-  const gpsResult = await pollGpsInfo(session, resolvedVin);
   if (gpsResult.ok) {
     stepLog('GPS info succeeded', {
       vin: resolvedVin,
@@ -2304,7 +2349,8 @@ async function main() {
   };
 
   writeStatusHtml(output, 'status.html');
-  stepLog('Wrote status HTML', { file: 'status.html' });
+  const totalMs = Number(process.hrtime.bigint() - tMain) / 1e6;
+  stepLog(`Total elapsed: ${totalMs.toFixed(0)}ms`, { file: 'status.html' });
 
   console.log(util.inspect(JSON.parse(JSON.stringify(output)), {
     depth: null,
