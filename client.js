@@ -56,7 +56,7 @@ const CONFIG = Object.freeze({
   vehicleBrand: process.env.BYD_VEHICLE_BRAND || '1',
   networkOperator: process.env.BYD_NETWORK_OPERATOR || '\u65e0',
   realtimePollAttempts: 10,
-  realtimePollIntervalMs: 250,
+  realtimePollIntervalMs: 1500,
 });
 
 const cookieJar = new Map();
