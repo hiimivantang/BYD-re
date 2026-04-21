@@ -158,15 +158,31 @@ function commonOuterFields() {
   };
 }
 
-const TIMERS = {};
+const TIMERS = Object.create(null);
 function timerStart(label) {
-  TIMERS[label] = process.hrtime.bigint();
+  const start = process.hrtime.bigint();
+  if (typeof label === 'string') {
+    if (!TIMERS[label]) TIMERS[label] = [];
+    TIMERS[label].push(start);
+  }
+  return start;
 }
-function timerEnd(label) {
-  const start = TIMERS[label];
-  if (!start) return 0;
+function timerEnd(labelOrStart) {
+  let start;
+
+  if (typeof labelOrStart === 'bigint') {
+    start = labelOrStart;
+  } else {
+    const label = labelOrStart;
+    const starts = TIMERS[label];
+    if (!starts || starts.length === 0) return 0;
+    start = starts.pop();
+    if (starts.length === 0) {
+      delete TIMERS[label];
+    }
+  }
+
   const elapsed = Number(process.hrtime.bigint() - start) / 1e6;
-  delete TIMERS[label];
   return elapsed;
 }
 
