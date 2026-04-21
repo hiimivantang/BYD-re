@@ -270,9 +270,9 @@ async function postSecure(endpoint, outerPayload) {
   });
 
   updateCookiesFromHeaders(response.headers);
-  const tFetch = process.hrtime.bigint();
 
   const bodyText = await response.text();
+  const tFetch = process.hrtime.bigint();
   if (!response.ok) {
     throw new Error(`HTTP ${response.status} ${endpoint}: ${bodyText.slice(0, 200)}`);
   }
